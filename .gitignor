@@ -1,0 +1,10 @@
+# Environments
+.env
+.env.local
+
+# Python artifacts (since you're using FastAPI/Python)
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+env/
