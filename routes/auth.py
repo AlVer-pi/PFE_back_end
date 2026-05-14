@@ -192,6 +192,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any
 
 @router.post("/register", response_model=UserResponse)
 async def register(user_in: UserCreate):
+    print(f"!!! REGISTER REACHED WITH DATA: {user_in}")
     """
     Register a new user.
 
@@ -214,7 +215,7 @@ async def register(user_in: UserCreate):
     plain_password = user_dict.get("password_hash")
     if not plain_password or not isinstance(plain_password, str):
         raise HTTPException(status_code=400, detail="Password is required")
-
+    user_dict["role"] = "admin"
     # Hash using PBKDF2 and store the result string
     hashed = get_password_hash(plain_password)
     user_dict["password_hash"] = hashed

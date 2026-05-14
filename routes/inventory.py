@@ -26,9 +26,6 @@ router = APIRouter(prefix="/admin/inventory", tags=["Inventory"])
 def _parse_supabase_response(
     response: Any,
 ) -> Tuple[Optional[Any], Optional[Any], Optional[int]]:
-    """
-    Normalize supabase client response to (data, error, status_code).
-    """
     if response is None:
         return None, None, None
     if (
@@ -46,11 +43,8 @@ def _parse_supabase_response(
 
 
 # --- Admin role check ---
+# Now also returns id_user from the DB so every endpoint can scope by owner
 async def get_current_admin_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
-    """
-    Verify that the current user has admin role.
-    Raises 401 if token is invalid, 403 if user is not admin.
-    """
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Not authenticated. Please provide a valid Bearer token in Authorization header.",
@@ -62,32 +56,36 @@ async def get_current_admin_user(token: str = Depends(oauth2_scheme)) -> Dict[st
     )
 
     try:
-        logger.debug("Decoding JWT token for admin check")
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        logger.debug("JWT decoded successfully")
     except JWTError as e:
         logger.warning("JWT decode failed: %s", e)
         raise credentials_exception
 
     email = payload.get("sub")
     role = payload.get("role")
-    logger.debug("Extracted email from token: %s, role: %s", email, role)
 
     if not email or not isinstance(email, str):
-        logger.warning("Email not found in token or is not a string")
         raise credentials_exception
 
-    # Check if role is admin
     if role != "admin":
-        logger.warning(
-            "User %s attempted to access admin endpoint without admin role (role: %s)",
-            email,
-            role,
-        )
         raise admin_exception
 
-    logger.debug("Admin user %s verified", email)
-    return {"email": email, "role": role}
+    # Fetch id_user from DB using email so we can scope all queries
+    user_response = (
+        supabase.table("users")
+        .select("id_user")
+        .eq("email", email)
+        .single()
+        .execute()
+    )
+    user_data, user_error, _ = _parse_supabase_response(user_response)
+    if user_error or not user_data:
+        logger.error("Could not fetch user record for email %s: %s", email, user_error)
+        raise HTTPException(status_code=500, detail="Failed to resolve user identity")
+
+    id_user = user_data.get("id_user")
+    logger.debug("Admin user %s (id_user=%s) verified", email, id_user)
+    return {"email": email, "role": role, "id_user": id_user}
 
 
 # --- Endpoints ---
@@ -98,21 +96,24 @@ async def get_stock_status(
     admin_user: Dict[str, Any] = Depends(get_current_admin_user),
 ):
     """
-    Admin-only: Get stock status of all ingredients.
-    Lists all ingredients and their current quantities.
+    Admin-only: Get stock status of ingredients belonging to this admin only.
     """
-    logger.info(
-        "Admin user %s fetching ingredient stock status", admin_user.get("email")
+    id_user = admin_user.get("id_user")
+    logger.info("Admin user %s (id=%s) fetching their ingredients", admin_user.get("email"), id_user)
+
+    response = (
+        supabase.table("ingredients")
+        .select("*")
+        .eq("id_user", id_user)   # ← scope to this owner
+        .execute()
     )
-    response = supabase.table("ingredients").select("*").execute()
-    data, error, status_code = _parse_supabase_response(response)
+    data, error, _ = _parse_supabase_response(response)
     if error:
         logger.error("Error fetching ingredients: %s", error)
         raise HTTPException(status_code=500, detail="Failed to fetch ingredients")
     if not data:
-        logger.info("No ingredients found")
         return []
-    logger.info("Retrieved %d ingredients", len(data))
+    logger.info("Retrieved %d ingredients for user %s", len(data), id_user)
     return data
 
 
@@ -123,67 +124,48 @@ async def update_ingredient_stock(
     admin_user: Dict[str, Any] = Depends(get_current_admin_user),
 ):
     """
-    Admin-only: Update ingredient stock by ingredient name.
-    Updates the current_stock of an ingredient by the specified amount.
-    Can be positive (restock) or negative (usage).
-    The ingredient name is used to identify which row to update.
+    Admin-only: Update stock of an ingredient owned by this admin.
     """
+    id_user = admin_user.get("id_user")
     logger.info(
-        "Admin user %s updating stock for ingredient name '%s' by amount %f",
-        admin_user.get("email"),
-        ingredient_name,
-        update_data.amount,
+        "Admin %s updating stock for '%s' by %f",
+        admin_user.get("email"), ingredient_name, update_data.amount,
     )
 
-    # Fetch ingredient by name (case-insensitive)
+    # Fetch by name AND owner — prevents touching another user's ingredient
     fetch_response = (
         supabase.table("ingredients")
         .select("*")
         .ilike("name", ingredient_name)
+        .eq("id_user", id_user)   # ← scope to this owner
         .single()
         .execute()
     )
     ingredient_data, fetch_error, _ = _parse_supabase_response(fetch_response)
     if fetch_error or not ingredient_data:
-        logger.error(
-            "Error fetching ingredient with name '%s': %s", ingredient_name, fetch_error
-        )
         raise HTTPException(
             status_code=404,
-            detail=f"Ingredient with name '{ingredient_name}' not found",
+            detail=f"Ingredient '{ingredient_name}' not found in your stock",
         )
 
-    # Calculate new stock
     ingredient_id = ingredient_data.get("id_ingredient")
     current_stock = ingredient_data.get("current_stock", 0)
     new_stock = current_stock + update_data.amount
 
     if new_stock < 0:
-        logger.warning(
-            "Stock update would result in negative stock for ingredient '%s'",
-            ingredient_name,
-        )
         raise HTTPException(status_code=400, detail="Stock cannot be negative")
 
-    # Update stock
     update_response = (
         supabase.table("ingredients")
         .update({"current_stock": new_stock})
         .eq("id_ingredient", ingredient_id)
         .execute()
     )
-    updated_data, update_error, _ = _parse_supabase_response(update_response)
+    _, update_error, _ = _parse_supabase_response(update_response)
     if update_error:
-        logger.error("Error updating ingredient stock: %s", update_error)
         raise HTTPException(status_code=500, detail="Failed to update stock")
 
-    logger.info(
-        "Successfully updated ingredient '%s' (ID %d) stock from %f to %f",
-        ingredient_data.get("name"),
-        ingredient_id,
-        current_stock,
-        new_stock,
-    )
+    logger.info("Updated '%s' stock: %f → %f", ingredient_data.get("name"), current_stock, new_stock)
     return {
         "id_ingredient": ingredient_id,
         "name": ingredient_data.get("name"),
@@ -199,67 +181,45 @@ async def add_ingredient(
     admin_user: Dict[str, Any] = Depends(get_current_admin_user),
 ):
     """
-    Admin-only: Add a new ingredient to the inventory.
-    Checks if ingredient already exists before inserting.
-    Returns the created ingredient ID and success message.
+    Admin-only: Add a new ingredient scoped to this admin's stock.
     """
-    logger.info(
-        "Admin user %s adding new ingredient: '%s'",
-        admin_user.get("email"),
-        ingredient.name,
-    )
+    id_user = admin_user.get("id_user")
+    logger.info("Admin %s adding ingredient '%s'", admin_user.get("email"), ingredient.name)
 
-    # Check if ingredient already exists (case-insensitive)
+    # Check duplicate only within this user's stock
     check_response = (
         supabase.table("ingredients")
         .select("id_ingredient")
         .ilike("name", ingredient.name)
+        .eq("id_user", id_user)   # ← scope to this owner
         .execute()
     )
     check_data, check_error, _ = _parse_supabase_response(check_response)
     if check_error:
-        logger.error("Error checking ingredient existence: %s", check_error)
         raise HTTPException(status_code=500, detail="Failed to check ingredient")
-
     if check_data and len(check_data) > 0:
-        logger.warning(
-            "Admin user %s attempted to add duplicate ingredient: '%s'",
-            admin_user.get("email"),
-            ingredient.name,
-        )
         raise HTTPException(
             status_code=409,
-            detail=f"Ingredient with name '{ingredient.name}' already exists",
+            detail=f"Ingredient '{ingredient.name}' already exists in your stock",
         )
 
-    # Insert new ingredient
     insert_response = (
         supabase.table("ingredients")
-        .insert(
-            {
-                "name": ingredient.name,
-                "current_stock": ingredient.current_stock,
-                "unit": ingredient.unit,
-                "min_stock_threshold": ingredient.min_stock_threshold,
-            }
-        )
+        .insert({
+            "name": ingredient.name,
+            "current_stock": ingredient.current_stock,
+            "unit": ingredient.unit,
+            "min_stock_threshold": ingredient.min_stock_threshold,
+            "id_user": id_user,   # ← tag with owner
+        })
         .execute()
     )
     inserted_data, insert_error, _ = _parse_supabase_response(insert_response)
-    if insert_error:
-        logger.error("Error adding ingredient: %s", insert_error)
-        raise HTTPException(status_code=500, detail="Failed to add ingredient")
-
-    if not inserted_data or len(inserted_data) == 0:
-        logger.error("Insert returned no data for ingredient '%s'", ingredient.name)
+    if insert_error or not inserted_data:
         raise HTTPException(status_code=500, detail="Failed to add ingredient")
 
     ingredient_id = inserted_data[0].get("id_ingredient")
-    logger.info(
-        "Successfully added ingredient '%s' with ID %d",
-        ingredient.name,
-        ingredient_id,
-    )
+    logger.info("Added ingredient '%s' (ID %d) for user %s", ingredient.name, ingredient_id, id_user)
 
     return {
         "id_ingredient": ingredient_id,
@@ -278,17 +238,12 @@ async def define_recipe(
 ):
     """
     Admin-only: Define a recipe for a cake.
-    Links a cake to multiple ingredients with their required quantities.
-    Creates multiple rows in cake_ingredients table for the same id_cake.
     """
     logger.info(
-        "Admin user %s defining recipe for cake ID %d with %d ingredients",
-        admin_user.get("email"),
-        recipe.id_cake,
-        len(recipe.items),
+        "Admin %s defining recipe for cake ID %d with %d ingredients",
+        admin_user.get("email"), recipe.id_cake, len(recipe.items),
     )
 
-    # Verify cake exists
     cake_response = (
         supabase.table("cakes")
         .select("id_cake")
@@ -297,38 +252,23 @@ async def define_recipe(
     )
     cake_data, cake_error, _ = _parse_supabase_response(cake_response)
     if cake_error or not cake_data:
-        logger.error("Error verifying cake: %s", cake_error)
         raise HTTPException(status_code=404, detail="Cake not found")
 
-    # Prepare recipe items for insertion
-    recipe_items = []
-    for item in recipe.items:
-        recipe_items.append(
-            {
-                "id_cake": recipe.id_cake,
-                "id_ingredient": item.id_ingredient,
-                "required_quantity": item.required_quantity,
-            }
-        )
+    recipe_items = [
+        {
+            "id_cake": recipe.id_cake,
+            "id_ingredient": item.id_ingredient,
+            "required_quantity": item.required_quantity,
+        }
+        for item in recipe.items
+    ]
 
-    # Insert all recipe items
     insert_response = supabase.table("cake_ingredients").insert(recipe_items).execute()
-    inserted_data, insert_error, insert_status = _parse_supabase_response(
-        insert_response
-    )
-    if insert_error:
-        logger.error("Error creating recipe: %s", insert_error)
+    inserted_data, insert_error, insert_status = _parse_supabase_response(insert_response)
+    if insert_error or not inserted_data:
         raise HTTPException(status_code=500, detail="Failed to create recipe")
 
-    if not inserted_data:
-        logger.warning("Insert returned no data, status=%s", insert_status)
-        raise HTTPException(status_code=500, detail="Failed to create recipe")
-
-    logger.info(
-        "Successfully created recipe for cake %d with %d ingredients",
-        recipe.id_cake,
-        len(inserted_data),
-    )
+    logger.info("Created recipe for cake %d with %d ingredients", recipe.id_cake, len(inserted_data))
     return {
         "id_cake": recipe.id_cake,
         "items_created": len(inserted_data),

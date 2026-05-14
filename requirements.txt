@@ -3,8 +3,8 @@ fastapi==0.104.1
 uvicorn[standard]==0.24.0
 
 # Database
-supabase==2.0.3
-supabase-py==2.0.3
+supabase>=2.0.0
+
 
 # Authentication and JWT
 python-jose[cryptography]==3.3.0
@@ -12,13 +12,11 @@ cryptography==41.0.7
 python-multipart==0.0.6
 
 # Data validation
-pydantic==2.5.0
-pydantic[email]==2.5.0
-email-validator==2.1.0
+pydantic<2
 
 # Environment variables
 python-dotenv==1.0.0
 
 # Development tools (optional, remove if not needed)
 pytest==7.4.3
-httpx==0.25.2
+httpx==0.27.2
