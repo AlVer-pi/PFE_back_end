@@ -20,11 +20,15 @@ logger = logging.getLogger("routes.orders")
 
 router = APIRouter(prefix="/orders", tags=["Orders"])
 
+# Statuses that trigger ingredient deduction (transition FROM pending)
+DEDUCT_ON_TRANSITION_TO = {"preparing", "out_for_delivery", "delivered"}
 
-# --- Supabase response helper ---
-def _parse_supabase_response(
-    response: Any,
-) -> Tuple[Optional[Any], Optional[Any], Optional[int]]:
+# Statuses that never deduct
+NO_DEDUCT_STATUSES = {"pending", "refused", "cancelled"}
+
+
+# --- Helpers ---
+def _parse_supabase_response(response: Any) -> Tuple[Optional[Any], Optional[Any], Optional[int]]:
     if response is None:
         return None, None, None
     if hasattr(response, "data") or hasattr(response, "error") or hasattr(response, "status_code"):
@@ -34,7 +38,6 @@ def _parse_supabase_response(
     return None, None, None
 
 
-# --- Shared helper: resolve id_user from email ---
 def _get_id_user(email: str) -> int:
     resp = supabase.table("users").select("id_user").eq("email", email).single().execute()
     data, error, _ = _parse_supabase_response(resp)
@@ -96,79 +99,101 @@ async def _create_alert(id_user: int, alert_type: str, message: str) -> bool:
         return False
 
 
-# --- Stock verification helper ---
-async def _verify_order_stock(
-    order_items: List[OrderItemBase], id_user: int
-) -> Tuple[bool, Optional[str]]:
-    for item in order_items:
-        id_cake = item.id_cake
-        quantity = item.quantity
+# --- Deduction logic ---
+async def _deduct_ingredients_for_order(id_order: int, id_user: int) -> None:
+    """
+    Deducts ingredients from stock based on the order's items and their recipes.
+    Fires a low-stock alert if any ingredient drops at or below its threshold after deduction.
+    Called only once: when status transitions from 'pending' to an active status.
+    """
+    logger.info("Deducting ingredients for order #%d", id_order)
 
-        recipe_response = (
+    # Get all items in this order
+    items_resp = (
+        supabase.table("order_items")
+        .select("id_cake, quantity")
+        .eq("id_order", id_order)
+        .execute()
+    )
+    items_data, items_error, _ = _parse_supabase_response(items_resp)
+    if items_error or not items_data:
+        logger.error("Could not fetch order items for order #%d", id_order)
+        return
+
+    for item in items_data:
+        id_cake = item.get("id_cake")
+        quantity_ordered = item.get("quantity", 1)
+
+        # Get the recipe for this cake
+        recipe_resp = (
             supabase.table("cake_ingredients")
             .select("id_ingredient, required_quantity")
             .eq("id_cake", id_cake)
             .execute()
         )
-        recipe_data, recipe_error, _ = _parse_supabase_response(recipe_response)
+        recipe_data, recipe_error, _ = _parse_supabase_response(recipe_resp)
         if recipe_error or not recipe_data:
-            error_msg = f"Recipe not found for cake ID {id_cake}"
-            await _create_alert(id_user, "insufficient_ingredients", error_msg)
-            return False, error_msg
+            logger.warning("No recipe found for cake #%d — skipping deduction", id_cake)
+            continue
 
         for recipe_item in recipe_data:
             id_ingredient = recipe_item.get("id_ingredient")
-            required_quantity = recipe_item.get("required_quantity")
-            needed_quantity = required_quantity * quantity
+            required_per_unit = recipe_item.get("required_quantity", 0)
+            total_to_deduct = required_per_unit * quantity_ordered
 
-            ingredient_response = (
+            # Fetch current stock
+            ing_resp = (
                 supabase.table("ingredients")
                 .select("name, current_stock, min_stock_threshold, unit")
                 .eq("id_ingredient", id_ingredient)
                 .single()
                 .execute()
             )
-            ingredient_data, ingredient_error, _ = _parse_supabase_response(ingredient_response)
-            if ingredient_error or not ingredient_data:
-                error_msg = f"Ingredient ID {id_ingredient} not found"
-                await _create_alert(id_user, "insufficient_ingredients", error_msg)
-                return False, error_msg
+            ing_data, ing_error, _ = _parse_supabase_response(ing_resp)
+            if ing_error or not ing_data:
+                logger.warning("Ingredient #%d not found — skipping", id_ingredient)
+                continue
 
-            current_stock = ingredient_data.get("current_stock", 0)
-            min_threshold = ingredient_data.get("min_stock_threshold", 0)
-            ingredient_name = ingredient_data.get("name", f"Ingredient {id_ingredient}")
-            unit = ingredient_data.get("unit", "unit")
+            current_stock = ing_data.get("current_stock", 0)
+            min_threshold = ing_data.get("min_stock_threshold", 0)
+            ing_name = ing_data.get("name", f"Ingredient #{id_ingredient}")
+            unit = ing_data.get("unit", "unit")
 
-            if current_stock <= min_threshold:
-                warning_msg = f"Warning: '{ingredient_name}' is at or below minimum threshold ({current_stock} {unit} <= {min_threshold} {unit})"
-                await _create_alert(id_user, "low_stock", warning_msg)
+            new_stock = max(0, current_stock - total_to_deduct)
 
-            if current_stock < needed_quantity:
-                error_msg = f"Insufficient stock for '{ingredient_name}'. Required: {needed_quantity} {unit}, Available: {current_stock} {unit}"
-                await _create_alert(id_user, "insufficient_ingredients", error_msg)
-                return False, error_msg
+            # Update stock
+            supabase.table("ingredients").update(
+                {"current_stock": new_stock}
+            ).eq("id_ingredient", id_ingredient).execute()
 
-    return True, None
+            logger.info(
+                "Deducted %.2f %s of '%s': %.2f → %.2f",
+                total_to_deduct, unit, ing_name, current_stock, new_stock,
+            )
+
+            # Fire low-stock alert if new stock is at or below threshold
+            if new_stock <= min_threshold:
+                await _create_alert(
+                    id_user,
+                    "low_stock",
+                    f"⚠️ '{ing_name}' is running low: {new_stock} {unit} remaining (threshold: {min_threshold} {unit})",
+                )
+                logger.info("Low-stock alert fired for '%s'", ing_name)
 
 
 # --- Endpoints ---
-
 
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=Dict[str, Any])
 async def create_order(
     order_data: OrderCreateRequest,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Create a new order. Verifies stock, deducts ingredients, fires alerts."""
+    """
+    Create a new order in 'pending' status.
+    No ingredient deduction happens here — deduction is triggered when
+    the admin moves the order out of 'pending'.
+    """
     id_client = current_user.get("id_user")
-    email = current_user.get("email")
-
-    if not id_client:
-        raise HTTPException(status_code=400, detail="User ID not found in token.")
-
-    is_valid, error_message = await _verify_order_stock(order_data.items, id_client)
-    if not is_valid:
-        raise HTTPException(status_code=400, detail=error_message or "Stock verification failed")
 
     insert_response = (
         supabase.table("orders")
@@ -192,44 +217,14 @@ async def create_order(
         for item in order_data.items
     ]
     items_response = supabase.table("order_items").insert(order_items_to_insert).execute()
-    items_data, items_error, _ = _parse_supabase_response(items_response)
+    _, items_error, _ = _parse_supabase_response(items_response)
     if items_error:
         supabase.table("orders").delete().eq("id_order", id_order).execute()
         raise HTTPException(status_code=500, detail="Failed to create order items")
 
-    # Reduce ingredient stock
-    for item in order_data.items:
-        recipe_response = (
-            supabase.table("cake_ingredients")
-            .select("id_ingredient, required_quantity")
-            .eq("id_cake", item.id_cake)
-            .execute()
-        )
-        recipe_data, recipe_error, _ = _parse_supabase_response(recipe_response)
-        if recipe_error or not recipe_data:
-            continue
-
-        for recipe_item in recipe_data:
-            id_ingredient = recipe_item.get("id_ingredient")
-            reduction_amount = recipe_item.get("required_quantity") * item.quantity
-
-            ing_response = (
-                supabase.table("ingredients")
-                .select("current_stock")
-                .eq("id_ingredient", id_ingredient)
-                .single()
-                .execute()
-            )
-            ing_data, ing_error, _ = _parse_supabase_response(ing_response)
-            if ing_error or not ing_data:
-                continue
-
-            new_stock = max(0, ing_data.get("current_stock", 0) - reduction_amount)
-            supabase.table("ingredients").update({"current_stock": new_stock}).eq("id_ingredient", id_ingredient).execute()
-
     await _create_alert(
         id_client, "new_order",
-        f"New order #{id_order} created. Total: {order_data.total_price}. Items: {len(order_data.items)}.",
+        f"New order #{id_order} received. Total: {order_data.total_price} DZD. Items: {len(order_data.items)}.",
     )
 
     return {
@@ -263,29 +258,16 @@ async def list_all_orders(
     status_filter: Optional[str] = None,
     admin_user: Dict[str, Any] = Depends(get_current_admin_user),
 ):
-    """
-    Admin-only: Get orders that contain at least one cake belonging to this admin.
-    Uses order_items → cakes join to filter by ownership.
-    """
+    """Admin-only: orders that contain at least one cake belonging to this admin."""
     id_user = admin_user.get("id_user")
-    logger.info("Admin %s fetching their orders", admin_user.get("email"))
 
-    # Step 1: get all cake IDs owned by this admin
-    cakes_resp = (
-        supabase.table("cakes")
-        .select("id_cake")
-        .eq("id_user", id_user)
-        .execute()
-    )
+    cakes_resp = supabase.table("cakes").select("id_cake").eq("id_user", id_user).execute()
     cakes_data, cakes_error, _ = _parse_supabase_response(cakes_resp)
-    if cakes_error:
-        raise HTTPException(status_code=500, detail="Failed to fetch cakes")
-    if not cakes_data:
+    if cakes_error or not cakes_data:
         return []
 
     owned_cake_ids = [c["id_cake"] for c in cakes_data]
 
-    # Step 2: get order_ids that contain any of those cakes
     items_resp = (
         supabase.table("order_items")
         .select("id_order")
@@ -293,19 +275,12 @@ async def list_all_orders(
         .execute()
     )
     items_data, items_error, _ = _parse_supabase_response(items_resp)
-    if items_error:
-        raise HTTPException(status_code=500, detail="Failed to fetch order items")
-    if not items_data:
+    if items_error or not items_data:
         return []
 
-    order_ids = list({row["id_order"] for row in items_data})  # deduplicate
+    order_ids = list({row["id_order"] for row in items_data})
 
-    # Step 3: fetch those orders
-    query = (
-        supabase.table("orders")
-        .select("*")
-        .in_("id_order", order_ids)
-    )
+    query = supabase.table("orders").select("*").in_("id_order", order_ids)
     if status_filter:
         query = query.eq("status", status_filter)
 
@@ -313,8 +288,6 @@ async def list_all_orders(
     data, error, _ = _parse_supabase_response(response)
     if error:
         raise HTTPException(status_code=500, detail="Failed to fetch orders")
-
-    logger.info("Retrieved %d orders for admin %s", len(data or []), admin_user.get("email"))
     return data or []
 
 
@@ -323,16 +296,10 @@ async def get_order_detail(
     id_order: int,
     admin_user: Dict[str, Any] = Depends(get_current_admin_user),
 ):
-    """
-    Admin-only: Get full detail of one order including its items and cake names.
-    Only accessible if the order contains a cake owned by this admin.
-    """
+    """Admin-only: full order detail including items. Only if this admin owns a cake in the order."""
     id_user = admin_user.get("id_user")
 
-    # Verify this order contains at least one cake owned by this admin
-    cakes_resp = (
-        supabase.table("cakes").select("id_cake").eq("id_user", id_user).execute()
-    )
+    cakes_resp = supabase.table("cakes").select("id_cake").eq("id_user", id_user).execute()
     cakes_data, _, _ = _parse_supabase_response(cakes_resp)
     owned_cake_ids = [c["id_cake"] for c in (cakes_data or [])]
 
@@ -346,15 +313,11 @@ async def get_order_detail(
     if items_error or not items_data:
         raise HTTPException(status_code=404, detail="Order not found")
 
-    # Check ownership
     order_cake_ids = [row["id_cake"] for row in items_data]
     if not any(cid in owned_cake_ids for cid in order_cake_ids):
         raise HTTPException(status_code=403, detail="This order does not belong to your cakes")
 
-    # Fetch order header
-    order_resp = (
-        supabase.table("orders").select("*").eq("id_order", id_order).single().execute()
-    )
+    order_resp = supabase.table("orders").select("*").eq("id_order", id_order).single().execute()
     order_data, order_error, _ = _parse_supabase_response(order_resp)
     if order_error or not order_data:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -369,8 +332,13 @@ async def update_order_status(
     new_status: str,
     admin_user: Dict[str, Any] = Depends(get_current_admin_user),
 ):
-    """Admin-only: Update order status. Only for orders containing this admin's cakes."""
-    allowed_statuses = ["pending", "preparing", "out_for_delivery", "delivered", "refused"]
+    """
+    Admin-only: Update order status.
+    Ingredient deduction fires ONCE when transitioning FROM 'pending'
+    to any active status (preparing / out_for_delivery / delivered).
+    No deduction for refused or cancelled.
+    """
+    allowed_statuses = ["pending", "preparing", "out_for_delivery", "delivered", "refused", "cancelled"]
     if new_status not in allowed_statuses:
         raise HTTPException(
             status_code=400,
@@ -379,23 +347,20 @@ async def update_order_status(
 
     id_user = admin_user.get("id_user")
 
-    # Verify ownership (same logic as above)
+    # Verify ownership
     cakes_resp = supabase.table("cakes").select("id_cake").eq("id_user", id_user).execute()
     cakes_data, _, _ = _parse_supabase_response(cakes_resp)
     owned_cake_ids = [c["id_cake"] for c in (cakes_data or [])]
 
-    items_resp = (
-        supabase.table("order_items").select("id_cake").eq("id_order", id_order).execute()
-    )
+    items_resp = supabase.table("order_items").select("id_cake").eq("id_order", id_order).execute()
     items_data, _, _ = _parse_supabase_response(items_resp)
     order_cake_ids = [row["id_cake"] for row in (items_data or [])]
 
     if not any(cid in owned_cake_ids for cid in order_cake_ids):
         raise HTTPException(status_code=403, detail="This order does not belong to your cakes")
 
-    fetch_response = (
-        supabase.table("orders").select("*").eq("id_order", id_order).single().execute()
-    )
+    # Fetch current order
+    fetch_response = supabase.table("orders").select("*").eq("id_order", id_order).single().execute()
     order_data, fetch_error, _ = _parse_supabase_response(fetch_response)
     if fetch_error or not order_data:
         raise HTTPException(status_code=404, detail="Order not found")
@@ -403,25 +368,53 @@ async def update_order_status(
     current_status = order_data.get("status")
     id_client = order_data.get("id_client")
 
+    # Guard: don't allow going backwards to pending once active
+    if current_status in DEDUCT_ON_TRANSITION_TO and new_status == "pending":
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot revert an active order back to pending.",
+        )
+
+    # Update status
     update_response = (
-        supabase.table("orders").update({"status": new_status}).eq("id_order", id_order).execute()
+        supabase.table("orders")
+        .update({"status": new_status})
+        .eq("id_order", id_order)
+        .execute()
     )
     _, update_error, _ = _parse_supabase_response(update_response)
     if update_error:
         raise HTTPException(status_code=500, detail="Failed to update order status")
 
+    # ── Deduction logic ──────────────────────────────────────────
+    # Trigger ONLY when transitioning FROM pending TO an active status
+    # This ensures ingredients are deducted exactly once per order
+    should_deduct = (
+        current_status == "pending"
+        and new_status in DEDUCT_ON_TRANSITION_TO
+    )
+    if should_deduct:
+        logger.info(
+            "Order #%d moved from '%s' → '%s': triggering ingredient deduction",
+            id_order, current_status, new_status,
+        )
+        await _deduct_ingredients_for_order(id_order, id_user)
+    # ─────────────────────────────────────────────────────────────
+
+    # Alert the client
     status_messages = {
-        "pending": "Your order is pending.",
-        "preparing": "Your order is being prepared.",
-        "out_for_delivery": "Your order is out for delivery!",
-        "delivered": "Your order has been delivered!",
-        "refused": "Your order has been refused. Please contact support.",
+        "cancelled":        "Your order has been cancelled.",
     }
-    await _create_alert(id_client, "order_status_update", status_messages.get(new_status, f"Order status: {new_status}"))
+    await _create_alert(
+        id_client,
+        "order_status_update",
+        status_messages.get(new_status, f"Order status updated to: {new_status}"),
+    )
 
     return {
         "id_order": id_order,
         "previous_status": current_status,
         "new_status": new_status,
+        "deduction_triggered": should_deduct,
         "message": "Order status updated successfully",
     }
