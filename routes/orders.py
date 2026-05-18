@@ -401,15 +401,14 @@ async def update_order_status(
         await _deduct_ingredients_for_order(id_order, id_user)
     # ─────────────────────────────────────────────────────────────
 
-    # Alert the client
-    status_messages = {
-        "cancelled":        "Your order has been cancelled.",
-    }
-    await _create_alert(
-        id_client,
-        "order_status_update",
-        status_messages.get(new_status, f"Order status updated to: {new_status}"),
-    )
+    # Only alert on 'cancelled' — that's a client-initiated action the admin needs to know about.
+    # All other status changes are admin-initiated, so no alert needed.
+    if new_status == "cancelled":
+        await _create_alert(
+            id_client,
+            "order_cancelled",
+            f"Order #{id_order} has been cancelled by the client.",
+        )
 
     return {
         "id_order": id_order,

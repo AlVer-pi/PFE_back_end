@@ -1,8 +1,9 @@
 import logging
 import os
+import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 
@@ -11,6 +12,7 @@ from schemas import CakeBase, CakeResponse, CakeWithRecipe
 
 SECRET_KEY = os.environ.get("JWT_SECRET") or os.environ.get("SUPABASE_KEY") or ""
 ALGORITHM = "HS256"
+STORAGE_BUCKET = "cake-images"
 
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="auth/login")
 
@@ -19,11 +21,12 @@ logger = logging.getLogger("routes.cakes")
 
 router = APIRouter(prefix="/cakes", tags=["Cakes"])
 
+ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
+MAX_FILE_SIZE_MB = 5
 
-# --- Supabase response helper ---
-def _parse_supabase_response(
-    response: Any,
-) -> Tuple[Optional[Any], Optional[Any], Optional[int]]:
+
+# --- Helpers ---
+def _parse_supabase_response(response: Any) -> Tuple[Optional[Any], Optional[Any], Optional[int]]:
     if response is None:
         return None, None, None
     if hasattr(response, "data") or hasattr(response, "error") or hasattr(response, "status_code"):
@@ -33,7 +36,6 @@ def _parse_supabase_response(
     return None, None, None
 
 
-# --- Shared helper: resolve id_user from email ---
 def _get_id_user(email: str) -> int:
     resp = supabase.table("users").select("id_user").eq("email", email).single().execute()
     data, error, _ = _parse_supabase_response(resp)
@@ -42,7 +44,7 @@ def _get_id_user(email: str) -> int:
     return data.get("id_user")
 
 
-# --- Admin guard (returns id_user) ---
+# --- Auth guards ---
 async def get_current_admin_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -57,18 +59,15 @@ async def get_current_admin_user(token: str = Depends(oauth2_scheme)) -> Dict[st
 
     email = payload.get("sub")
     role = payload.get("role")
-
     if not email or not isinstance(email, str):
         raise credentials_exception
     if role != "admin":
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Admin role required.")
 
     id_user = _get_id_user(email)
-    logger.debug("Admin %s (id_user=%s) verified", email, id_user)
     return {"email": email, "role": role, "id_user": id_user}
 
 
-# --- User guard (any logged-in user, returns id_user) ---
 async def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
@@ -91,6 +90,63 @@ async def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any
 
 # --- Endpoints ---
 
+@router.post("/admin/upload-image", status_code=status.HTTP_200_OK)
+async def upload_cake_image(
+    file: UploadFile = File(...),
+    admin_user: Dict[str, Any] = Depends(get_current_admin_user),
+):
+    """
+    Admin-only: Upload a cake image to Supabase Storage.
+    Returns the public URL to store in the cakes table.
+    Accepts: JPEG, PNG, WEBP, GIF. Max size: 5MB.
+    """
+    # Validate MIME type
+    if file.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid file type '{file.content_type}'. Allowed: JPEG, PNG, WEBP, GIF.",
+        )
+
+    # Read file and validate size
+    contents = await file.read()
+    size_mb = len(contents) / (1024 * 1024)
+    if size_mb > MAX_FILE_SIZE_MB:
+        raise HTTPException(
+            status_code=400,
+            detail=f"File too large ({size_mb:.1f}MB). Maximum allowed: {MAX_FILE_SIZE_MB}MB.",
+        )
+
+    # Build a unique filename: {id_user}/{uuid}.{ext}
+    ext = file.content_type.split("/")[-1].replace("jpeg", "jpg")
+    id_user = admin_user.get("id_user")
+    filename = f"{id_user}/{uuid.uuid4().hex}.{ext}"
+
+    logger.info(
+        "Admin %s uploading image '%s' (%.2f MB) as '%s'",
+        admin_user.get("email"), file.filename, size_mb, filename,
+    )
+
+    # Upload to Supabase Storage
+    try:
+        upload_resp = supabase.storage.from_(STORAGE_BUCKET).upload(
+            path=filename,
+            file=contents,
+            file_options={"content-type": file.content_type},
+        )
+    except Exception as e:
+        logger.error("Supabase storage upload failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Upload failed: {str(e)}")
+
+    # Get the public URL
+    try:
+        public_url = supabase.storage.from_(STORAGE_BUCKET).get_public_url(filename)
+    except Exception as e:
+        logger.error("Failed to get public URL: %s", e)
+        raise HTTPException(status_code=500, detail="Upload succeeded but failed to get public URL")
+
+    logger.info("Image uploaded successfully: %s", public_url)
+    return {"photo_url": public_url, "filename": filename}
+
 
 @router.get("/", response_model=List[CakeResponse])
 async def list_cakes(
@@ -100,12 +156,10 @@ async def list_cakes(
 ):
     """List cakes belonging to this user only."""
     id_user = current_user.get("id_user")
-    logger.info("User %s fetching their cakes", current_user.get("email"))
-
     response = (
         supabase.table("cakes")
         .select("*")
-        .eq("id_user", id_user)          # ← scoped to owner
+        .eq("id_user", id_user)
         .range(offset, offset + limit - 1)
         .execute()
     )
@@ -120,14 +174,14 @@ async def get_cake_details(
     id_cake: int,
     current_user: Dict[str, Any] = Depends(get_current_user),
 ):
-    """Get cake details + recipe. Only accessible if this cake belongs to the user."""
+    """Get cake details + recipe. Only if this cake belongs to the user."""
     id_user = current_user.get("id_user")
 
     cake_response = (
         supabase.table("cakes")
         .select("*")
         .eq("id_cake", id_cake)
-        .eq("id_user", id_user)          # ← scoped to owner
+        .eq("id_user", id_user)
         .single()
         .execute()
     )
@@ -165,13 +219,13 @@ async def create_cake(
     cake: CakeBase,
     admin_user: Dict[str, Any] = Depends(get_current_admin_user),
 ):
-    """Admin-only: Add a new cake tagged to this admin."""
+    """Admin-only: Add a new cake. photo_url should be the URL returned by /admin/upload-image."""
     id_user = admin_user.get("id_user")
     logger.info("Admin %s creating cake '%s'", admin_user.get("email"), cake.name)
 
     cake_data = cake.dict()
     cake_data["price"] = float(cake_data["price"])
-    cake_data["id_user"] = id_user          # ← tag with owner
+    cake_data["id_user"] = id_user
 
     response = supabase.table("cakes").insert(cake_data).execute()
     data, error, _ = _parse_supabase_response(response)
@@ -185,25 +239,37 @@ async def delete_cake(
     id_cake: int,
     admin_user: Dict[str, Any] = Depends(get_current_admin_user),
 ):
-    """Admin-only: Delete a cake. Only works if the cake belongs to this admin."""
+    """Admin-only: Delete a cake. Also removes the image from storage if present."""
     id_user = admin_user.get("id_user")
     logger.info("Admin %s deleting cake ID %d", admin_user.get("email"), id_cake)
 
-    # Verify cake exists AND belongs to this admin
+    # Fetch cake to get photo_url before deleting
     check_resp = (
         supabase.table("cakes")
-        .select("id_cake")
+        .select("id_cake, photo_url")
         .eq("id_cake", id_cake)
-        .eq("id_user", id_user)          # ← scoped to owner
+        .eq("id_user", id_user)
         .execute()
     )
-    cake_exists, error, _ = _parse_supabase_response(check_resp)
-    if error or not cake_exists:
+    cake_data, error, _ = _parse_supabase_response(check_resp)
+    if error or not cake_data:
         raise HTTPException(status_code=404, detail="Cake not found")
 
+    # Delete from DB
     response = supabase.table("cakes").delete().eq("id_cake", id_cake).execute()
     _, error, _ = _parse_supabase_response(response)
     if error:
         raise HTTPException(status_code=500, detail="Failed to delete cake")
+
+    # Clean up image from storage if it was uploaded to our bucket
+    photo_url = cake_data[0].get("photo_url") or ""
+    if STORAGE_BUCKET in photo_url:
+        try:
+            # Extract the path after the bucket name
+            path = photo_url.split(f"{STORAGE_BUCKET}/")[-1]
+            supabase.storage.from_(STORAGE_BUCKET).remove([path])
+            logger.info("Deleted image from storage: %s", path)
+        except Exception as e:
+            logger.warning("Could not delete image from storage: %s", e)
 
     return {"message": f"Cake {id_cake} successfully removed from menu"}
