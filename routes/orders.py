@@ -183,6 +183,101 @@ async def _deduct_ingredients_for_order(id_order: int, id_user: int) -> None:
 
 # --- Endpoints ---
 
+async def _check_order_stock(items: list, id_admin: int) -> None:
+    """
+    Check whether the order requires more ingredients than are currently in stock.
+    If any ingredient is insufficient, fire an alert that includes the total needed
+    and how much more is required to fulfill the order.
+    """
+    if not items:
+        return
+
+    cake_quantities: dict[int, int] = {}
+    for item in items:
+        id_cake = item.id_cake if hasattr(item, 'id_cake') else item.get('id_cake')
+        quantity_ordered = item.quantity if hasattr(item, 'quantity') else item.get('quantity', 1)
+        if id_cake is None or quantity_ordered <= 0:
+            continue
+        cake_quantities[id_cake] = cake_quantities.get(id_cake, 0) + quantity_ordered
+
+    if not cake_quantities:
+        return
+
+    recipe_resp = (
+        supabase.table("cake_ingredients")
+        .select("id_cake, id_ingredient, required_quantity")
+        .in_("id_cake", list(cake_quantities.keys()))
+        .execute()
+    )
+    recipe_data, recipe_error, _ = _parse_supabase_response(recipe_resp)
+    if recipe_error or not recipe_data:
+        logger.warning("Failed to fetch cake recipes for order stock check: %s", recipe_error)
+        return
+
+    needed_by_ingredient: dict[int, float] = {}
+    for recipe_item in recipe_data:
+        id_cake = recipe_item.get("id_cake")
+        id_ingredient = recipe_item.get("id_ingredient")
+        required_per_unit = float(recipe_item.get("required_quantity", 0) or 0)
+        quantity_ordered = cake_quantities.get(id_cake, 0)
+        if id_ingredient is None or quantity_ordered <= 0:
+            continue
+        needed_by_ingredient[id_ingredient] = (
+            needed_by_ingredient.get(id_ingredient, 0.0) + required_per_unit * quantity_ordered
+        )
+
+    if not needed_by_ingredient:
+        logger.warning("No ingredient totals computed for order stock check")
+        return
+
+    ing_resp = (
+        supabase.table("ingredients")
+        .select("id_ingredient, name, current_stock, min_stock_threshold, unit")
+        .in_("id_ingredient", list(needed_by_ingredient.keys()))
+        .execute()
+    )
+    ing_data, ing_error, _ = _parse_supabase_response(ing_resp)
+    if ing_error:
+        logger.warning("Failed to fetch ingredient stock data: %s", ing_error)
+        return
+
+    ingredients_map = {ing["id_ingredient"]: ing for ing in (ing_data or [])}
+
+    for id_ingredient, total_needed in needed_by_ingredient.items():
+        ing = ingredients_map.get(id_ingredient)
+        if not ing:
+            logger.warning("Ingredient #%s not found, skipping stock check", id_ingredient)
+            continue
+
+        current_stock = float(ing.get("current_stock", 0) or 0)
+        min_threshold = float(ing.get("min_stock_threshold", 0) or 0)
+        ing_name = ing.get("name", f"Ingredient #{id_ingredient}")
+        unit = ing.get("unit", "unit")
+
+        if current_stock < total_needed:
+            shortage = total_needed - current_stock
+            msg = (
+                f"⚠️ Insufficient stock alert: '{ing_name}' requires {total_needed:.2f} {unit} "
+                f"for this order, but only {current_stock:.2f} {unit} is available. "
+                f"Need an additional {shortage:.2f} {unit} to fulfill the order."
+            )
+            await _create_alert(id_admin, "insufficient_stock", msg)
+            logger.warning(
+                "Insufficient stock alert fired for '%s': need %.2f, have %.2f",
+                ing_name,
+                total_needed,
+                current_stock,
+            )
+
+        elif current_stock <= min_threshold:
+            warn_msg = (
+                f"⚠️ Low stock warning: '{ing_name}' is at {current_stock:.2f} {unit} "
+                f"(threshold: {min_threshold:.2f} {unit}). Consider restocking soon."
+            )
+            await _create_alert(id_admin, "low_stock", warn_msg)
+            logger.info("Low-stock warning fired for '%s'", ing_name)
+
+
 @router.post("", status_code=status.HTTP_201_CREATED, response_model=Dict[str, Any])
 async def create_order(
     order_data: OrderCreateRequest,
@@ -190,10 +285,30 @@ async def create_order(
 ):
     """
     Create a new order in 'pending' status.
-    No ingredient deduction happens here — deduction is triggered when
-    the admin moves the order out of 'pending'.
+    Checks ingredient stock before accepting — fires alerts for insufficient or low stock.
+    Deduction happens later when admin moves status out of 'pending'.
     """
     id_client = current_user.get("id_user")
+    print(f"!!! create_order called by id_client={id_client}, items={[(i.id_cake, i.quantity) for i in order_data.items]}")
+
+    # Resolve the admin who owns these cakes to send alerts to them
+    id_admin = id_client  # fallback
+    if order_data.items:
+        first_cake_resp = (
+            supabase.table("cakes")
+            .select("id_user")
+            .eq("id_cake", order_data.items[0].id_cake)
+            .single()
+            .execute()
+        )
+        first_cake_data, _, _ = _parse_supabase_response(first_cake_resp)
+        if first_cake_data:
+            id_admin = first_cake_data.get("id_user", id_client)
+    print(f"!!! id_admin resolved to {id_admin}")
+
+    # Check stock before accepting
+    await _check_order_stock(order_data.items, id_admin)
+    print(f"!!! _check_order_stock completed")
 
     insert_response = (
         supabase.table("orders")
@@ -223,7 +338,7 @@ async def create_order(
         raise HTTPException(status_code=500, detail="Failed to create order items")
 
     await _create_alert(
-        id_client, "new_order",
+        id_admin, "new_order",
         f"New order #{id_order} received. Total: {order_data.total_price} DZD. Items: {len(order_data.items)}.",
     )
 

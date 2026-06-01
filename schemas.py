@@ -2,6 +2,7 @@
 from datetime import datetime
 from decimal import Decimal
 from typing import List
+from typing import Optional
 
 from pydantic import BaseModel, EmailStr
 
@@ -122,7 +123,7 @@ class OrderCreateRequest(BaseModel):
     items: List[OrderItemBase]
     total_price: Decimal
     delivery_address: str
-    delivery_lat_lng: dict  # JSON for lat/lng
+    delivery_lat_lng: Optional[str] = None  # JSON for lat/lng
 
 
 class OrderResponse(OrderBase):
