@@ -1,8 +1,6 @@
-# Put the pydentic BaseModel here
 from datetime import datetime
 from decimal import Decimal
-from typing import List
-from typing import Optional
+from typing import List, Optional
 
 from pydantic import BaseModel, EmailStr
 
@@ -12,13 +10,13 @@ class UserBase(BaseModel):
     email: EmailStr
     last_name: str
     first_name: str
-    phone_number: str
-    address: str
+    phone_number: Optional[str] = None
+    address: Optional[str] = None
     role: str = "client"
 
 
 class UserCreate(UserBase):
-    password_hash: str  # In a real app, send 'password' and hash it before DB
+    password_hash: str
 
 
 class UserResponse(UserBase):
@@ -43,20 +41,20 @@ class IngredientResponse(IngredientBase):
         from_attributes = True
 
 
-class IngredientStockUpdate(BaseModel):
-    name: str
+class StockAmountUpdate(BaseModel):
     amount: float
 
 
-class StockAmountUpdate(BaseModel):
+class IngredientStockUpdate(BaseModel):
+    name: str
     amount: float
 
 
 # --- CAKES ---
 class CakeBase(BaseModel):
     name: str
-    photo_url: str
-    description: str
+    photo_url: Optional[str] = None
+    description: Optional[str] = None
     price: Decimal
     average_rating: float = 0.0
     is_available: bool = True
@@ -80,11 +78,12 @@ class CakeWithRecipe(CakeResponse):
     recipe: List[IngredientDetail] = []
 
 
-# --- RECIPES (Cake Ingredients) ---
+# --- RECIPES ---
 class RecipeBase(BaseModel):
     id_cake: int
     id_ingredient: int
     required_quantity: float
+    unit: Optional[str] = None  # unit used in the recipe (may differ from stored unit)
 
 
 class RecipeResponse(RecipeBase):
@@ -97,6 +96,7 @@ class RecipeResponse(RecipeBase):
 class RecipeItemCreate(BaseModel):
     id_ingredient: int
     required_quantity: float
+    unit: Optional[str] = None  # if omitted, defaults to the ingredient's stored unit
 
 
 class RecipeCreate(BaseModel):
@@ -114,16 +114,14 @@ class OrderBase(BaseModel):
     status: str = "pending"
     total_price: Decimal
     delivery_address: str
-    delivery_lat_lng: dict  # JSON for lat/lng
+    delivery_lat_lng: Optional[str] = None
 
 
 class OrderCreateRequest(BaseModel):
-    """Request model for creating an order (id_client extracted from JWT)"""
-
     items: List[OrderItemBase]
     total_price: Decimal
     delivery_address: str
-    delivery_lat_lng: Optional[str] = None  # JSON for lat/lng
+    delivery_lat_lng: Optional[str] = None
 
 
 class OrderResponse(OrderBase):

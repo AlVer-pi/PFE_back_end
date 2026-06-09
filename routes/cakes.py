@@ -7,8 +7,9 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile, status
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 
+from .inventory import convert_to_stored_unit
 from database import supabase
-from schemas import CakeBase, CakeResponse, CakeWithRecipe
+from schemas import CakeBase, CakeResponse, CakeWithRecipe, RecipeCreate
 
 SECRET_KEY = os.environ.get("JWT_SECRET") or os.environ.get("SUPABASE_KEY") or ""
 ALGORITHM = "HS256"
@@ -232,6 +233,86 @@ async def create_cake(
     if error or not data:
         raise HTTPException(status_code=500, detail="Failed to create cake")
     return data[0]
+
+
+@router.put("/admin/cakes/{id_cake}/recipe", status_code=status.HTTP_200_OK)
+async def update_cake_recipe(
+    id_cake: int,
+    recipe: RecipeCreate,
+    admin_user: Dict[str, Any] = Depends(get_current_admin_user),
+):
+    """Admin-only: Update a cake's recipe by replacing its ingredients list."""
+    if recipe.id_cake != id_cake:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Cake ID in path and request body must match.",
+        )
+
+    cake_response = (
+        supabase.table("cakes")
+        .select("id_cake")
+        .eq("id_cake", id_cake)
+        .eq("id_user", admin_user.get("id_user"))
+        .single()
+        .execute()
+    )
+    cake_data, cake_error, _ = _parse_supabase_response(cake_response)
+    if cake_error or not cake_data:
+        raise HTTPException(status_code=404, detail="Cake not found")
+
+    recipe_items = []
+    for item in recipe.items:
+        ing_resp = (
+            supabase.table("ingredients")
+            .select("id_ingredient, name, unit")
+            .eq("id_ingredient", item.id_ingredient)
+            .single()
+            .execute()
+        )
+        ing_data, ing_error, _ = _parse_supabase_response(ing_resp)
+        if ing_error or not ing_data:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Ingredient ID {item.id_ingredient} not found",
+            )
+
+        stored_unit = ing_data.get("unit", "").lower().strip()
+        recipe_unit = (item.unit or stored_unit).lower().strip()
+        quantity = item.required_quantity
+
+        if recipe_unit != stored_unit:
+            try:
+                quantity = convert_to_stored_unit(quantity, recipe_unit, stored_unit)
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+
+        recipe_items.append({
+            "id_cake": id_cake,
+            "id_ingredient": item.id_ingredient,
+            "required_quantity": quantity,
+        })
+
+    delete_response = (
+        supabase.table("cake_ingredients").delete().eq("id_cake", id_cake).execute()
+    )
+    _, delete_error, _ = _parse_supabase_response(delete_response)
+    if delete_error:
+        raise HTTPException(status_code=500, detail="Failed to clear existing recipe")
+
+    if recipe_items:
+        insert_response = supabase.table("cake_ingredients").insert(recipe_items).execute()
+        inserted_data, insert_error, _ = _parse_supabase_response(insert_response)
+        if insert_error or not inserted_data:
+            raise HTTPException(status_code=500, detail="Failed to update recipe")
+    else:
+        inserted_data = []
+
+    return {
+        "id_cake": id_cake,
+        "items_updated": len(inserted_data),
+        "message": "Recipe updated successfully",
+        "recipe": inserted_data,
+    }
 
 
 @router.delete("/{id_cake}", status_code=status.HTTP_200_OK)
